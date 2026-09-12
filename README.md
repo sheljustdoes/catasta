@@ -1,16 +1,189 @@
 # catasta
 
-Modular FastAPI + Next.js scaffold for serving ML research projects as polished, interactive demos.
+Two ways to turn a research pipeline into a polished, interactive demo without shipping the pipeline itself to the browser.
 
-catasta is a reusable project scaffold for turning research pipelines into
-production-quality interactive demos. It pairs a FastAPI backend (where your
-science lives) with a Next.js + TypeScript frontend (where people experience
-it). Designed to be forked per project — swap the pipeline, adjust the UI,
-deploy. The architecture stays the same; the research changes.
+catasta pairs a Python backend (where the science lives, and stays server-side) with a Next.js + TypeScript frontend (where people experience it). It comes in two variants:
+
+- **Variant A — Embedded.** One portfolio site, one shared backend, demos as routes. Default choice.
+- **Variant B — Standalone.** Forked per project, its own frontend + backend deployment, its own URL.
+
+The pipeline pattern (`preprocess → predict → postprocess`, structured request/response schemas, upload-and-reveal UI) is identical in both — only the deployment topology differs.
 
 ---
 
-## Architecture
+## Choosing a variant
+
+| | Variant A — Embedded | Variant B — Standalone |
+|---|---|---|
+| Frontend | A route inside the existing portfolio site | Its own Next.js app, its own repo |
+| Backend | One shared FastAPI service, one router per project | Its own FastAPI service |
+| Hosting | Frontend: GitHub Pages (static export). Backend: one small Railway/Render instance | Frontend: Vercel. Backend: its own Railway/Render instance |
+| Cost/upkeep | One backend to pay for and monitor, regardless of demo count | One backend per project |
+| Use when | The demo just needs to show input → output behind an API boundary | The project needs independent scaling (e.g. GPU inference), its own domain/identity, or is being spun out separately from the portfolio |
+
+Default to **Variant A**. Reach for **Variant B** only when a specific project actually needs to stand alone — most demos don't.
+
+---
+
+## Variant A — Embedded (default)
+
+### Architecture
+
+```
+sheljustdoes.github.io/            # the portfolio site itself
+├── app/
+│   ├── projects/
+│   │   ├── iridis/
+│   │   │   └── page.tsx           # demo route — calls /api/iridis/predict
+│   │   ├── topos/
+│   │   │   └── page.tsx
+│   │   └── veridian/
+│   │       └── page.tsx
+│   ├── layout.tsx
+│   └── page.tsx                   # résumé / landing
+├── components/
+│   ├── upload/Dropzone.tsx        # shared across demo routes
+│   └── results/ResultCard.tsx
+├── lib/
+│   ├── api.ts                     # client for the shared backend
+│   └── types.ts
+└── next.config.ts                 # output: 'export', images.unoptimized: true
+
+demo-backend/                       # one small service, separate repo
+├── main.py                         # mounts one router per project
+├── routers/
+│   ├── iridis.py
+│   ├── topos.py
+│   └── veridian.py
+├── services/
+│   ├── iridis_pipeline.py          # each project's Pipeline class
+│   ├── topos_pipeline.py
+│   └── veridian_pipeline.py
+├── core/
+│   ├── config.py
+│   └── models.py                   # schemas, namespaced per project
+├── requirements.txt
+└── Dockerfile
+```
+
+Two repos instead of one, but only ever *two* — the frontend repo is the portfolio site you already have, and the backend repo grows by one router + one pipeline module per new demo rather than by one whole deployment.
+
+### Backend — one service, routed per project
+
+`main.py`:
+
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from routers import iridis, topos, veridian
+from core.config import settings
+
+app = FastAPI(title="demo-backend", version=settings.VERSION)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(iridis.router, prefix="/api/iridis", tags=["iridis"])
+app.include_router(topos.router, prefix="/api/topos", tags=["topos"])
+app.include_router(veridian.router, prefix="/api/veridian", tags=["veridian"])
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+```
+
+`routers/iridis.py` (same shape for every project — this is the file that repeats):
+
+```python
+import time
+from fastapi import APIRouter, UploadFile, File, HTTPException
+from core.models import PredictionResponse
+from services.iridis_pipeline import IridisPipeline
+
+router = APIRouter()
+pipeline = IridisPipeline(model_path="./models/iridis", device="cpu")
+
+
+@router.post("/predict", response_model=PredictionResponse)
+async def predict(file: UploadFile = File(...)):
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Expected an image file")
+
+    start = time.time()
+    contents = await file.read()
+    results = pipeline.run(contents)
+
+    return PredictionResponse(
+        project="iridis",
+        results=results,
+        processing_time_ms=round((time.time() - start) * 1000, 2),
+    )
+```
+
+`services/iridis_pipeline.py` follows the same `preprocess → predict → postprocess` shape as Variant B's `Pipeline` class below — see that section for the full pattern; only the class name and module location change (one file per project instead of one file, period).
+
+### Frontend — a route, not a repo
+
+`app/projects/iridis/page.tsx` is Variant B's `app/page.tsx` (below) with two changes: it's nested under `app/projects/iridis/` instead of being the site root, and its fetch call points at `/api/iridis/predict` on the shared backend instead of `/api/v1/predict` on a dedicated one. The `Dropzone` and `ResultCard` components are shared verbatim across every project route — write them once, import everywhere.
+
+`lib/api.ts`:
+
+```typescript
+const API_BASE = process.env.NEXT_PUBLIC_API_URL!; // one shared backend URL
+
+export async function predictIridis(file: File) {
+  const formData = new FormData();
+  formData.append("file", file);
+  const res = await fetch(`${API_BASE}/api/iridis/predict`, { method: "POST", body: formData });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail ?? `API error: ${res.status}`);
+  return res.json();
+}
+// predictTopos, searchVeridian, etc. follow the same shape.
+```
+
+### Deployment
+
+**Backend → Railway or Render**, once, same as Variant B:
+
+```bash
+railway init
+railway up
+```
+
+**Frontend → GitHub Pages**, via static export instead of Vercel:
+
+```ts
+// next.config.ts
+const nextConfig = {
+  output: "export",
+  images: { unoptimized: true },   // no Image Optimization server on static hosts
+};
+export default nextConfig;
+```
+
+A GitHub Actions workflow (`.github/workflows/deploy-pages.yml`) builds and publishes `out/` on every push to `main` — no manual deploy step, no Vercel account. Set `NEXT_PUBLIC_API_URL` as a repository variable so it's baked in at build time.
+
+### Adding a new demo
+
+1. Add `routers/<project>.py` + `services/<project>_pipeline.py` to the shared backend; mount the router in `main.py`.
+2. Add `app/projects/<project>/page.tsx` to the site, reusing `Dropzone`/`ResultCard`.
+3. Push both. No new deployment target.
+
+---
+
+## Variant B — Standalone
+
+Use this when a project needs to be its own thing: independent scaling, its own domain, or a deployment lifecycle decoupled from the rest of the portfolio.
+
+Forked per project — swap the pipeline, adjust the UI, deploy. The architecture stays the same across forks; the research changes.
+
+### Architecture
 
 ```
 project-demo/
@@ -58,11 +231,9 @@ project-demo/
 └── README.md
 ```
 
----
+### API — FastAPI Backend
 
-## API — FastAPI Backend
-
-### `api/main.py`
+#### `api/main.py`
 
 ```python
 from fastapi import FastAPI
@@ -92,7 +263,7 @@ async def health():
     return {"status": "ok", "project": settings.PROJECT_NAME}
 ```
 
-### `api/core/config.py`
+#### `api/core/config.py`
 
 ```python
 from pydantic_settings import BaseSettings
@@ -122,7 +293,7 @@ class Settings(BaseSettings):
 settings = Settings()
 ```
 
-### `api/core/models.py`
+#### `api/core/models.py`
 
 ```python
 from pydantic import BaseModel
@@ -152,7 +323,7 @@ class PredictionResponse(BaseModel):
     processing_time_ms: Optional[float] = None
 ```
 
-### `api/routes/predict.py`
+#### `api/routes/predict.py`
 
 ```python
 import time
@@ -190,7 +361,7 @@ async def predict(file: UploadFile = File(...)):
     )
 ```
 
-### `api/services/pipeline.py`
+#### `api/services/pipeline.py`
 
 ```python
 from typing import List
@@ -259,11 +430,9 @@ class Pipeline:
         return self.postprocess(raw_output)
 ```
 
----
+### Frontend — Next.js + TypeScript + Tailwind
 
-## Frontend — Next.js + TypeScript + Tailwind
-
-### `web/lib/types.ts`
+#### `web/lib/types.ts`
 
 ```typescript
 // Mirror your API response schemas
@@ -291,7 +460,7 @@ export interface DemoState {
 }
 ```
 
-### `web/lib/api.ts`
+#### `web/lib/api.ts`
 
 ```typescript
 import { PredictionResponse } from "./types";
@@ -316,7 +485,7 @@ export async function predict(file: File): Promise<PredictionResponse> {
 }
 ```
 
-### `web/app/layout.tsx`
+#### `web/app/layout.tsx`
 
 ```tsx
 import type { Metadata } from "next";
@@ -331,9 +500,8 @@ const font = Inter({
 
 export const metadata: Metadata = {
   // ---- Swap per project ----
-  title: "iridis — Perceptual Skin Tone Classification",
-  description:
-    "Explore 40+ computationally recovered skin tone phenotypes from 2M+ diverse images.",
+  title: "Project Demo",
+  description: "One-line description of what this demo shows.",
 };
 
 export default function RootLayout({
@@ -351,7 +519,7 @@ export default function RootLayout({
 }
 ```
 
-### `web/app/page.tsx`
+#### `web/app/page.tsx`
 
 ```tsx
 "use client";
@@ -396,10 +564,8 @@ export default function DemoPage() {
     <main className="mx-auto max-w-3xl px-6 py-16">
       {/* ---- Project header — swap per project ---- */}
       <header className="mb-12">
-        <h1 className="text-3xl font-semibold tracking-tight">iridis</h1>
-        <p className="mt-2 text-neutral-500">
-          Perceptual skin tone classification from imaging data
-        </p>
+        <h1 className="text-3xl font-semibold tracking-tight">Project Name</h1>
+        <p className="mt-2 text-neutral-500">One-line description</p>
       </header>
 
       {/* Upload or results */}
@@ -465,7 +631,7 @@ export default function DemoPage() {
 }
 ```
 
-### `web/components/upload/Dropzone.tsx`
+#### `web/components/upload/Dropzone.tsx`
 
 ```tsx
 "use client";
@@ -545,7 +711,7 @@ export function Dropzone({
 }
 ```
 
-### `web/components/results/ResultCard.tsx`
+#### `web/components/results/ResultCard.tsx`
 
 ```tsx
 import type { PredictionResult } from "@/lib/types";
@@ -583,13 +749,9 @@ export function ResultCard({ result }: ResultCardProps) {
 }
 ```
 
----
+### Adapting per project
 
-## Adapting Per Project
-
-The scaffold is designed so that swapping projects requires changes in only a few places:
-
-### Backend — what to change:
+#### Backend — what to change:
 
 | File | What to swap |
 |------|-------------|
@@ -598,7 +760,7 @@ The scaffold is designed so that swapping projects requires changes in only a fe
 | `services/pipeline.py` | The actual science — load, preprocess, predict, postprocess |
 | `routes/predict.py` | Input type (`UploadFile` for images, `Body` for JSON, etc.) |
 
-### Frontend — what to change:
+#### Frontend — what to change:
 
 | File | What to swap |
 |------|-------------|
@@ -608,21 +770,18 @@ The scaffold is designed so that swapping projects requires changes in only a fe
 | `lib/types.ts` | Type definitions to match new API response shape |
 | `lib/api.ts` | Endpoint path if changed; input encoding if not FormData |
 
-### Input patterns per project type:
+#### Input patterns per project type:
 
-| Project | Input | Component |
+| Project type | Input | Component |
 |---------|-------|-----------|
-| **iridis** | Image upload | `Dropzone` (image/*) |
-| **lambent** | Image upload | `Dropzone` (image/*) |
-| **topos** | Genomic data file (.csv, .vcf) | `Dropzone` (accept=".csv,.vcf") |
-| **veridian** | Search query (text) | Text input + submit |
-| **recolo** | Conversation / text | Text area + submit |
+| Image classification/clustering | Image upload | `Dropzone` (image/*) |
+| Genomic/tabular data | File upload | `Dropzone` (accept=".csv,.vcf") |
+| Literature/text retrieval | Search query | Text input + submit |
+| Conversational/agentic | Conversation | Text area + submit |
 
----
+### Deployment
 
-## Deployment
-
-### Backend → Railway (or Render)
+#### Backend → Railway (or Render)
 ```bash
 # From api/ directory
 railway init
@@ -639,7 +798,7 @@ COPY . .
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-### Frontend → Vercel
+#### Frontend → Vercel
 ```bash
 # From web/ directory
 vercel
@@ -647,9 +806,7 @@ vercel
 
 Set `NEXT_PUBLIC_API_URL` in Vercel environment variables to point to your Railway backend URL.
 
----
-
-## Quick Start
+### Quick Start
 
 ```bash
 # Backend
@@ -665,3 +822,9 @@ npm run dev
 ```
 
 API at `http://localhost:8000`, frontend at `http://localhost:3000`.
+
+---
+
+## Status
+
+Both variants are specifications, not scaffolded code yet — this README is the source of truth until a project actually needs one instantiated. First real build will be Variant A, once the iridis segmentation rework (in progress) lands.
